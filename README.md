@@ -2,10 +2,10 @@
 
 ## Build
 
-$ `cd ~/your_workspace/src`
-$ `git clone https://github.com/onebeany/lidar2lidar.git`
-$ `cd ~/your_workspace`
-$ `catkin build`
+$ `cd ~/your_workspace/src`  
+$ `git clone https://github.com/onebeany/lidar2lidar.git`  
+$ `cd ~/your_workspace`  
+$ `catkin build` 
 
 ## Launch
 
