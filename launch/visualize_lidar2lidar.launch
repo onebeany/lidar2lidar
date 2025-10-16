@@ -1,0 +1,58 @@
+<launch>
+    <!-- Select between original and refactored version -->
+    <arg name="use_refactored" default="false" />
+    
+    <node pkg="lidar2lidar" 
+          type="$(eval 'visualize_lidar2lidar_refactored' if arg('use_refactored') else 'visualize_lidar2lidar')" 
+          name="visualize_lidar2lidar" 
+          output="screen">
+        <!--env name="ROSCONSOLE_CONFIG_FILE" value="$(find lvi_q)/config/rosconsole_debug.config" -->
+        <param name="use_marker_" type="bool" value="false" />
+        <param name="manual_len_ratio_" type="double" value="0.0" />
+        <param name="manual_rotate_roll_" type="double" value="0.0" />
+        <param name="manual_rotate_pitch_" type="double" value="0.0" />
+        <param name="manual_rotate_yaw_" type="double" value="-102.04" />
+        <param name="additional_rotate_roll_" type="double" value="-0.4549159" />
+        <param name="additional_rotate_pitch_" type="double" value="-0.4494354" />
+        <!-- <param name="additional_rotate_yaw_" type="double" value="-0.420375" /> -->
+        <param name="additional_rotate_yaw_" type="double" value="89.57962" />
+        <param name="manual_x_add_" type="double" value="0.7" />
+        <param name="manual_y_add_" type="double" value="2.0" />
+        <param name="manual_z_add_" type="double" value="-1.37" />
+        <param name="icp_threshold_" type="double" value="4.0"/>
+        <param name="icp_delta_threshold_" type="double" value="0.4"/>
+        <!-- <param name="icp_delta_threshold_" type="double" value="0.35"/> -->
+
+        <param name="use_improve_pipeline_" type="bool" value="true" />
+
+        <!-- TUNE when use_improve_pipeline_ is true -->
+        <param name="improve_use_dynamic_roi_" type="bool" value="true" />
+
+        <param name="improve_roi_pad_x_" type="double" value="0.5" />
+        <param name="improve_roi_pad_y_" type="double" value="0.5" />
+        <param name="improve_roi_pad_z_" type="double" value="2.0" />
+
+        <param name="improve_coarse_leaf_size_" type="double" value="0.25" />
+        <param name="improve_fine_leaf_size_" type="double" value="0.12" />
+        <param name="improve_coarse_max_iterations_" type="int" value="5" />
+        <param name="improve_fine_max_iterations_" type="int" value="5" />
+        <param name="improve_coarse_max_corr_dist_" type="double" value="0.8" />
+        <param name="improve_fine_max_corr_dist_" type="double" value="0.4" />
+        
+        <param name="improve_icp_transformation_epsilon_" type="double" value="1e-8" />
+        <param name="improve_icp_euclidean_epsilon_" type="double" value="1e-8" />
+        <param name="improve_gicp_max_corr_dist_" type="double" value="0.5" />
+        <param name="improve_gicp_max_iterations_" type="int" value="10" />
+        <param name="improve_gicp_correspondence_randomness_" type="int" value="20" />
+        <param name="improve_gicp_ransac_iterations_" type="int" value="50" />
+        <param name="improve_gicp_transformation_epsilon_" type="double" value="1e-6" />
+        <param name="improve_gicp_euclidean_fitness_epsilon_" type="double" value="1e-6" />
+        <!-- <rosparam param="lidar1_ext_q_">[0.0065011, 0.0935792, 0.0013775, 0.9955897]</rosparam> -->
+        <!-- <rosparam param="lidar1_ext_q_">[0.0768941, 0.0554137, -0.7043813, 0.7034654]</rosparam> -->
+        <!-- <rosparam param="lidar1_ext_t_">[1.10, -0.6457, 2.10]</rosparam> -->
+        <rosparam param="lidar1_ext_q_">[0, 0, 0, 1.0]</rosparam>
+        <rosparam param="lidar1_ext_t_">[0.0, 0.0, 0.0]</rosparam>
+    </node>
+    <node launch-prefix="nice" pkg="rviz" type="rviz" name="rviz" output="screen"
+          args="-d $(find lidar2lidar)/config/rviz_cfg/kinematic_custom.rviz"/>
+</launch>

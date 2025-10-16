@@ -1,0 +1,1373 @@
+#define PCL_NO_PRECOMPILE
+
+#include <ros/ros.h>
+#include <std_msgs/Float64MultiArray.h>
+#include <visualization_msgs/MarkerArray.h>
+#include <nav_msgs/Odometry.h>
+#include <geometry_msgs/Point.h>
+#include <sensor_msgs/PointCloud2.h>
+#include <tf2_ros/transform_broadcaster.h>
+#include <tf2/LinearMath/Quaternion.h>
+#include <tf2_geometry_msgs/tf2_geometry_msgs.h>
+#include <interactive_markers/interactive_marker_server.h>
+#include <interactive_markers/menu_handler.h>
+#include <visualization_msgs/InteractiveMarker.h>
+#include <visualization_msgs/InteractiveMarkerControl.h>
+#include <pcl_conversions/pcl_conversions.h>
+#include <pcl/filters/voxel_grid.h>
+#include <pcl/filters/passthrough.h>
+#include <pcl/filters/crop_box.h>
+#include <pcl/sample_consensus/method_types.h>
+#include <pcl/sample_consensus/model_types.h>
+#include <pcl/segmentation/sac_segmentation.h>
+#include <pcl/common/transforms.h>
+#include <pcl/point_types.h>
+#include <Eigen/Geometry>
+#include <cmath>
+#include <pcl/registration/icp.h>
+#include <nano_gicp/nano_gicp.hpp>
+#include <nano_gicp/point_type_nano_gicp.hpp>
+#include <nano_gicp/impl/lsq_registration_impl.hpp>
+#include <nano_gicp/impl/nano_gicp_impl.hpp>
+#include <chrono> // Add this header for timing
+#include <array>
+#include <algorithm>
+#include <limits>
+#include <sstream>
+#include <iomanip>
+#include <iostream>
+#include <vector>
+#include <mutex>
+#include <numeric>
+#include <atomic>
+
+namespace mlx_ros {
+  struct EIGEN_ALIGN16 Point {
+      PCL_ADD_POINT4D;
+      float intensity;
+      uint32_t offset_time;
+      uint16_t ring;
+      EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+  };
+}  // namespace mlx_ros
+POINT_CLOUD_REGISTER_POINT_STRUCT(mlx_ros::Point,
+    (float, x, x)
+    (float, y, y)
+    (float, z, z)
+    (float, intensity, intensity)
+    (uint32_t, offset_time, offset_time)
+    (uint16_t, ring, ring)
+)
+
+class KinematicChainVisualizer
+{
+public:
+    enum class AlignTimerStep
+    {
+        PREP = 0,
+        ROI,
+        DOWNSAMPLE_LiDAR1,
+        DOWNSAMPLE_LiDAR2,
+        ICP,
+        GICP,
+        COUNT
+    };
+
+    static constexpr size_t kAlignTimerCount = static_cast<size_t>(AlignTimerStep::COUNT);
+    using RawPoint = mlx_ros::Point;
+    using RawCloud = pcl::PointCloud<RawPoint>;
+    using RawCloudPtr = typename RawCloud::Ptr;
+    using CloudPoint = pcl::PointXYZINormal;
+    using Cloud = pcl::PointCloud<CloudPoint>;
+    using CloudPtr = typename Cloud::Ptr;
+
+    struct AlignMetrics
+    {
+        size_t source_points = 0;
+        size_t source_coarse_points = 0;
+        size_t source_fine_points = 0;
+        size_t target_points = 0;
+        size_t target_roi_points = 0;
+        size_t target_coarse_points = 0;
+        size_t target_fine_points = 0;
+        bool coarse_icp_converged = false;
+        bool fine_icp_converged = false;
+        bool gicp_converged = false;
+        double coarse_icp_fitness = -1.0;
+        double fine_icp_fitness = -1.0;
+        double gicp_fitness = -1.0;
+        double translation_norm = 0.0;
+        double rotation_angle_deg = 0.0;
+        double pre_icp_time_us = 0.0;
+        double icp_processing_time_us = 0.0;
+    };
+
+    KinematicChainVisualizer() : user_q_(0, 0, 0, 1)
+    {
+        ros::NodeHandle nh("~");
+        sub_ = nh.subscribe("/Kinematic/DH_Angle", 1, &KinematicChainVisualizer::DH_callback, this);
+        lidar1_sub_ = nh.subscribe("/ml_/pointcloud", 1, &KinematicChainVisualizer::lidar1_callback, this);
+        lidar2_sub_ = nh.subscribe("/ml_/pointcloud2", 1, &KinematicChainVisualizer::lidar2_callback, this);
+        pub_ = nh.advertise<visualization_msgs::MarkerArray>("/kinematic_chain_markers", 1);
+        cloud1_pub_ = nh.advertise<sensor_msgs::PointCloud2>("/lidar1_transformed", 1);
+        cloud1_rgb_pub_ = nh.advertise<sensor_msgs::PointCloud2>("/lidar1_transformed_rgb", 1);
+        cloud1_roi_pub_ = nh.advertise<sensor_msgs::PointCloud2>("/lidar1_cropped_ROI", 1);
+        cloud2_kinematics_pub_ = nh.advertise<sensor_msgs::PointCloud2>("/lidar2_kinematics", 1);
+        cloud2_coarse_icp_pub_ = nh.advertise<sensor_msgs::PointCloud2>("/lidar2_coarse_ICP", 1);
+        cloud2_fine_icp_pub_ = nh.advertise<sensor_msgs::PointCloud2>("/lidar2_fine_ICP", 1);
+        cloud2_gicp_pub_ = nh.advertise<sensor_msgs::PointCloud2>("/lidar2_GICP", 1);
+        cloud2_pub_ = nh.advertise<sensor_msgs::PointCloud2>("/lidar2_transformed", 1);
+        cloud_merged_pub_ = nh.advertise<sensor_msgs::PointCloud2>("/cloud_merged", 1);
+        cloud_merged_rgb_pub_ = nh.advertise<sensor_msgs::PointCloud2>("/cloud_merged_rgb", 1);
+        nh.param<bool>("use_marker_", use_marker_, false);
+        nh.param<double>("manual_len_ratio_", manual_len_ratio_, 0.5);
+        nh.param<double>("manual_rotate_roll_", manual_rotate_roll_, 0.0);
+        nh.param<double>("manual_rotate_pitch_", manual_rotate_pitch_, 0.0);
+        nh.param<double>("manual_rotate_yaw_", manual_rotate_yaw_, 0.0);
+        nh.param<double>("additional_rotate_roll_", additional_rotate_roll_, 0.0);
+        nh.param<double>("additional_rotate_pitch_", additional_rotate_pitch_, 0.0);
+        nh.param<double>("additional_rotate_yaw_", additional_rotate_yaw_, 0.0);
+        nh.param<double>("manual_x_add_", manual_x_add_, 0.0);
+        nh.param<double>("manual_y_add_", manual_y_add_, 0.0);
+        nh.param<double>("manual_z_add_", manual_z_add_, 0.0);
+        nh.param<double>("icp_threshold_", icp_threshold_, 3.5);
+        nh.param<double>("icp_delta_threshold_", icp_delta_threshold_, 0.3);
+
+        // Load lidar1_ext_t_
+        if (!nh.getParam("lidar1_ext_t_", lidar1_ext_t_)) {
+            ROS_WARN("Parameter 'lidar1_ext_t_' not found, using default: [0.0, 0.0, 0.0]");
+            lidar1_ext_t_ = {0.0, 0.0, 0.0};
+        } else if (lidar1_ext_t_.size() != 3) {
+            ROS_ERROR("Parameter 'lidar1_ext_t_' must have exactly 3 elements, using default: [0.0, 0.0, 0.0]");
+            lidar1_ext_t_ = {0.0, 0.0, 0.0};
+        } else {
+            ROS_INFO("Loaded lidar1_ext_t_: [%.6f, %.6f, %.6f]",
+                     lidar1_ext_t_[0], lidar1_ext_t_[1], lidar1_ext_t_[2]);
+        }
+
+        // Load lidar1_ext_q_
+        if (!nh.getParam("lidar1_ext_q_", lidar1_ext_q_)) {
+            ROS_WARN("Parameter 'lidar1_ext_q_' not found, using default: [0.0, 0.0, 0.0, 1.0]");
+            lidar1_ext_q_ = {0.0, 0.0, 0.0, 1.0};
+        } else if (lidar1_ext_q_.size() != 4) {
+            ROS_ERROR("Parameter 'lidar1_ext_q_' must have exactly 4 elements, using default: [0.0, 0.0, 0.0, 1.0]");
+            lidar1_ext_q_ = {0.0, 0.0, 0.0, 1.0};
+        } else {
+            ROS_INFO("Loaded lidar1_ext_q_: [%.6f, %.6f, %.6f, %.6f]",
+                     lidar1_ext_q_[0], lidar1_ext_q_[1], lidar1_ext_q_[2], lidar1_ext_q_[3]);
+            // Verify and normalize quaternion
+            Eigen::Quaternionf quat(lidar1_ext_q_[3], lidar1_ext_q_[0], lidar1_ext_q_[1], lidar1_ext_q_[2]);
+            if (std::abs(quat.norm() - 1.0) > 1e-3) {
+                ROS_WARN("lidar1_ext_q_ is not a unit quaternion (norm=%.6f), normalizing", quat.norm());
+                quat.normalize();
+                lidar1_ext_q_ = {quat.x(), quat.y(), quat.z(), quat.w()};
+            }
+        }
+
+        prev_icp_trans=Eigen::Vector3f::Zero();
+
+        lidar1_cloud_.reset(new Cloud());
+        server_.reset(new interactive_markers::InteractiveMarkerServer("lidar_orientation_control"));
+        createInteractiveMarker();
+
+        nano_gicp_.setMaxCorrespondenceDistance(0.5);
+        nano_gicp_.setNumThreads(20);
+        nano_gicp_.setCorrespondenceRandomness(20);
+        nano_gicp_.setMaximumIterations(10);
+        nano_gicp_.setTransformationEpsilon(1e-6);
+        nano_gicp_.setEuclideanFitnessEpsilon(1e-6);
+        nano_gicp_.setRANSACIterations(50);
+
+        // NOTE: tune via launch parameters when enabling the improved pipeline.
+        nh.param<bool>("use_improve_pipeline_", improve_pipeline_enabled_, false);
+        nh.param<bool>("improve_use_dynamic_roi_", improve_use_dynamic_roi_, true);
+        nh.param<double>("improve_roi_pad_x_", improve_roi_pad_x_, 0.5);
+        nh.param<double>("improve_roi_pad_y_", improve_roi_pad_y_, 0.5);
+        nh.param<double>("improve_roi_pad_z_", improve_roi_pad_z_, 0.5);
+        nh.param<double>("improve_coarse_leaf_size_", improve_coarse_leaf_size_, 0.4);
+        nh.param<double>("improve_fine_leaf_size_", improve_fine_leaf_size_, 0.15);
+        nh.param<int>("improve_coarse_max_iterations_", improve_coarse_max_iterations_, 30);
+        nh.param<int>("improve_fine_max_iterations_", improve_fine_max_iterations_, 20);
+        nh.param<double>("improve_coarse_max_corr_dist_", improve_coarse_max_corr_dist_, 1.0);
+        nh.param<double>("improve_fine_max_corr_dist_", improve_fine_max_corr_dist_, 0.5);
+        nh.param<double>("improve_icp_transformation_epsilon_", improve_icp_transformation_epsilon_, 1e-5);
+        nh.param<double>("improve_icp_euclidean_epsilon_", improve_icp_euclidean_epsilon_, 1e-5);
+        nh.param<double>("improve_gicp_max_corr_dist_", improve_gicp_max_corr_dist_, 0.4);
+        nh.param<int>("improve_gicp_max_iterations_", improve_gicp_max_iterations_, 15);
+        nh.param<int>("improve_gicp_correspondence_randomness_", improve_gicp_correspondence_randomness_, 15);
+        nh.param<double>("improve_gicp_ransac_iterations_", improve_gicp_ransac_iterations_, 50);
+        nh.param<double>("improve_gicp_transformation_epsilon_", improve_gicp_transformation_epsilon_, 1e-5);
+        nh.param<double>("improve_gicp_euclidean_fitness_epsilon_", improve_gicp_euclidean_fitness_epsilon_, 1e-5);
+
+        user_input_timer_ = nh.createTimer(ros::Duration(0.1), &KinematicChainVisualizer::inputWatcher, this);
+    }
+
+    ~KinematicChainVisualizer()
+    {
+        printTimingSummary();
+    }
+
+private:
+    using HighResClock = std::chrono::high_resolution_clock;
+
+    ros::Subscriber sub_, lidar2_sub_, lidar1_sub_;
+    ros::Publisher pub_, cloud1_pub_, cloud1_rgb_pub_, cloud1_roi_pub_, cloud2_pub_;
+    ros::Publisher cloud2_kinematics_pub_, cloud2_coarse_icp_pub_, cloud2_fine_icp_pub_, cloud2_gicp_pub_;
+    ros::Publisher cloud_merged_pub_, cloud_merged_rgb_pub_;
+    std::string frame_id_ = "world";
+    std::shared_ptr<interactive_markers::InteractiveMarkerServer> server_;
+    double manual_rotate_roll_, manual_rotate_pitch_, manual_rotate_yaw_;
+    double additional_rotate_roll_, additional_rotate_pitch_, additional_rotate_yaw_;
+    tf2::Quaternion user_q_;
+    bool use_marker_ = false;
+    geometry_msgs::Point joint1_, joint2_;
+    double manual_len_ratio_ = 0.5;
+    //LiDAR1
+    CloudPtr lidar1_cloud_;
+    std::vector<double> lidar1_ext_t_, lidar1_ext_q_;
+    bool joints_ready_ = false;
+    double manual_x_add_=0.0,manual_y_add_=0.0,manual_z_add_=0.0;
+    Eigen::Vector3f prev_icp_trans;
+    std_msgs::Header lidar1_header_;
+    Eigen::Matrix3f last_icp_rot_=Eigen::Matrix3f::Identity();
+    Eigen::Vector3f last_icp_trans_=Eigen::Vector3f::Zero();
+    bool icp_first_success_=false;
+    double icp_threshold_;
+    double icp_delta_threshold_;
+    nano_gicp::NanoGICP<CloudPoint, CloudPoint> nano_gicp_;
+    bool improve_pipeline_enabled_;
+    bool improve_use_roi_;
+    bool improve_use_dynamic_roi_;
+    double improve_roi_pad_x_, improve_roi_pad_y_, improve_roi_pad_z_;
+    double improve_coarse_leaf_size_;
+    double improve_fine_leaf_size_;
+    int improve_coarse_max_iterations_;
+    int improve_fine_max_iterations_;
+    double improve_coarse_max_corr_dist_;
+    double improve_fine_max_corr_dist_;
+    double improve_icp_transformation_epsilon_;
+    double improve_icp_euclidean_epsilon_;
+    double improve_gicp_max_corr_dist_;
+    int improve_gicp_max_iterations_;
+    int improve_gicp_correspondence_randomness_;
+    double improve_gicp_ransac_iterations_;
+    double improve_gicp_transformation_epsilon_;
+    double improve_gicp_euclidean_fitness_epsilon_;
+    
+    ros::Time lidar1_cache_stamp_;
+    ros::Time gicp_target_stamp_;
+    ros::Timer user_input_timer_;
+    std::vector<double> pre_icp_history_ms_;
+    std::vector<double> icp_history_ms_;
+    std::mutex timing_mutex_;
+    std::atomic<bool> stats_printed_{false};
+
+    void createInteractiveMarker()
+    {
+        visualization_msgs::InteractiveMarker int_marker;
+        int_marker.header.frame_id = "world";
+        int_marker.name = "lidar_orientation";
+        int_marker.description = "RPY Control";
+        int_marker.scale = 1.0;
+        tf2::Quaternion q(0, 0, 0, 1);
+        q.normalize();
+        int_marker.pose.orientation = tf2::toMsg(q);
+
+        addRotationControl(int_marker, "rotate_x", 1, 0, 0);
+        addRotationControl(int_marker, "rotate_y", 0, 1, 0);
+        addRotationControl(int_marker, "rotate_z", 0, 0, 1);
+
+        server_->insert(int_marker, boost::bind(&KinematicChainVisualizer::processFeedback, this, _1));
+        server_->applyChanges();
+    }
+
+    void addRotationControl(visualization_msgs::InteractiveMarker& marker, const std::string& name,
+                           float x, float y, float z)
+    {
+        visualization_msgs::InteractiveMarkerControl control;
+        control.orientation.w = 1;
+        control.orientation.x = x;
+        control.orientation.y = y;
+        control.orientation.z = z;
+        control.name = name;
+        control.interaction_mode = visualization_msgs::InteractiveMarkerControl::ROTATE_AXIS;
+        marker.controls.push_back(control);
+    }
+
+    void processFeedback(const visualization_msgs::InteractiveMarkerFeedbackConstPtr& feedback)
+    {
+        tf2::Quaternion q;
+        tf2::fromMsg(feedback->pose.orientation, q);
+        q.normalize();
+        user_q_ = q;
+    }
+
+    void pushTimingSample(double pre_ms, double icp_ms)
+    {
+        std::lock_guard<std::mutex> lock(timing_mutex_);
+        pre_icp_history_ms_.push_back(pre_ms);
+        icp_history_ms_.push_back(icp_ms);
+    }
+
+    void appendTimingStats(const std::string& label, const std::vector<double>& samples, std::ostringstream& out)
+    {
+        out << label << ":\n";
+        if (samples.empty())
+        {
+            out << "  samples : 0\n";
+            return;
+        }
+
+        auto minmax = std::minmax_element(samples.begin(), samples.end());
+        double sum = std::accumulate(samples.begin(), samples.end(), 0.0);
+        double mean = sum / static_cast<double>(samples.size());
+        double variance = 0.0;
+        for (double v : samples)
+        {
+            double diff = v - mean;
+            variance += diff * diff;
+        }
+        if (samples.size() > 1)
+        {
+            variance /= static_cast<double>(samples.size() - 1);
+        }
+        else
+        {
+            variance = 0.0;
+        }
+        double stddev = std::sqrt(std::max(0.0, variance));
+
+        out << std::fixed << std::setprecision(3)
+            << "  samples : " << samples.size() << '\n'
+            << "  mean    : " << mean << " ms\n"
+            << "  min     : " << *minmax.first << " ms\n"
+            << "  max     : " << *minmax.second << " ms\n"
+            << "  stddev  : " << stddev << " ms\n";
+    }
+
+    void printTimingSummary()
+    {
+        if (stats_printed_.exchange(true))
+        {
+            return;
+        }
+
+        std::vector<double> pre_samples;
+        std::vector<double> icp_samples;
+        {
+            std::lock_guard<std::mutex> lock(timing_mutex_);
+            pre_samples = pre_icp_history_ms_;
+            icp_samples = icp_history_ms_;
+        }
+
+        std::ostringstream out;
+        out << "\n==== Timing Summary (ms) ====\n";
+        appendTimingStats("Pre-ICP processing", pre_samples, out);
+        appendTimingStats("ICP + GICP processing", icp_samples, out);
+        out << "=============================\n";
+        std::cout << out.str() << std::flush;
+    }
+
+    void inputWatcher(const ros::TimerEvent&)
+    {
+        static bool prompt_printed = false;
+        if (!prompt_printed)
+        {
+            ROS_INFO("Press 'q' then Enter to stop the node and print timing statistics.");
+            prompt_printed = true;
+        }
+
+        std::streambuf* buf = std::cin.rdbuf();
+        if (!buf)
+        {
+            return;
+        }
+
+        if (buf->in_avail() <= 0)
+        {
+            return;
+        }
+
+        std::string line;
+        std::getline(std::cin, line);
+        if (line == "q" || line == "Q" || line == "quit" || line == "exit")
+        {
+            printTimingSummary();
+            ros::shutdown();
+        }
+    }
+
+    /*
+    Kinematics via Dennevit-Hasenberg
+    This one uses the DH method to calculate the kinematics, and also process the callback from the ros topic. 
+    The important part you need to make sure is maybe just the DH_callback reflects the true position of the arm
+    */
+    Eigen::Matrix4f make_DH_matrix(float theta, float d, float a, float alpha)
+    {
+        Eigen::Matrix4f mat;
+        mat << cos(theta), -sin(theta) * cos(alpha), sin(theta) * sin(alpha), a * cos(theta),
+               sin(theta), cos(theta) * cos(alpha), -cos(theta) * sin(alpha), a * sin(theta),
+               0, sin(alpha), cos(alpha), d,
+               0, 0, 0, 1;
+        return mat;
+    }
+
+    void create_axis_markers(const Eigen::Matrix4f& transform, int id_offset, const std::string& frame_id,
+                            ros::Time stamp, visualization_msgs::MarkerArray& marker_array,
+                            float r, float g, float b) 
+    {
+        // Extract rotation and translation
+        Eigen::Matrix3f R = transform.block<3,3>(0,0);
+        Eigen::Vector3f t = transform.block<3,1>(0,3);
+
+        // Define axes (x, y, z)
+        std::vector<Eigen::Vector3f> axes = {
+            R * Eigen::Vector3f(0.5, 0, 0), // X-axis
+            R * Eigen::Vector3f(0, 0.5, 0), // Y-axis
+            R * Eigen::Vector3f(0, 0, 0.5)  // Z-axis
+        };
+        std::vector<std::tuple<float, float, float>> colors = {
+            {r, 0, 0}, // Red for x
+            {0, g, 0}, // Green for y
+            {0, 0, b}  // Blue for z
+        };
+
+        for (int i = 0; i < 3; ++i) 
+        {
+            visualization_msgs::Marker marker;
+            marker.header.frame_id = frame_id;
+            marker.header.stamp = stamp;
+            marker.ns = "axes";
+            marker.id = id_offset + i;
+            marker.type = visualization_msgs::Marker::ARROW;
+            marker.action = visualization_msgs::Marker::ADD;
+
+            // Start point (origin of frame)
+            marker.points.resize(2);
+            marker.points[0].x = t(0);
+            marker.points[0].y = t(1);
+            marker.points[0].z = t(2);
+            // End point (along axis)
+            marker.points[1].x = t(0) + axes[i](0);
+            marker.points[1].y = t(1) + axes[i](1);
+            marker.points[1].z = t(2) + axes[i](2);
+
+            marker.scale.x = 0.05; // Shaft diameter
+            marker.scale.y = 0.1;  // Head diameter
+            marker.scale.z = 0.1;  // Head length
+            marker.color.a = 1.0;
+            marker.color.r = std::get<0>(colors[i]);
+            marker.color.g = std::get<1>(colors[i]);
+            marker.color.b = std::get<2>(colors[i]);
+
+            marker_array.markers.push_back(marker);
+        }
+    }
+
+    void DH_callback(const std_msgs::Float64MultiArray::ConstPtr& msg)
+    {
+        const std::vector<double>& data = msg->data;
+        Eigen::Matrix4f boom_angle_DH_mat = make_DH_matrix(0,0.0, 0, -data[0]);
+        Eigen::Matrix4f boom_len_DH_mat = make_DH_matrix(0, 5.7, 0, 0.0);
+        Eigen::Matrix4f roll_mat;
+        roll_mat << 1, 0, 0, 0,
+                    0, cos(90.0*M_PI/180.0),-sin(90.0*M_PI/180.0),0,
+                    0, sin(90.0*M_PI/180.0), cos(90.0*M_PI/180.0),0,
+                    0,0,0,1;
+        Eigen::Matrix4f origin = Eigen::Matrix4f::Identity();
+        Eigen::Matrix4f roll_transform = origin * roll_mat;
+        Eigen::Matrix4f boom_yaw = roll_transform * boom_angle_DH_mat;
+        Eigen::Matrix4f boom_pos = boom_yaw * boom_len_DH_mat;
+
+        // Create MarkerArray
+        visualization_msgs::MarkerArray marker_array;
+        ros::Time stamp = ros::Time::now();
+
+        // Origin frame (identity) - Red axes
+        create_axis_markers(origin, 0, "world", stamp, marker_array, 1.0, 0.0, 0.0);
+        // After roll (origin * roll_mat) - Green axes
+        create_axis_markers(roll_transform, 3, "world", stamp, marker_array, 0.0, 1.0, 0.0);
+        // Final boom position (origin * roll_mat * boom_DH_mat) - Blue axes
+        create_axis_markers(boom_yaw, 6, "world", stamp, marker_array, 0.0, 0.0, 1.0);
+
+        create_axis_markers(boom_pos, 9, "world", stamp, marker_array, 0.0, 0.0, 1.0);
+
+        joint1_.x= 0.0;joint1_.y= 0.0;joint1_.z= 0.0;
+        joint2_.x= boom_pos(0,3);joint2_.y= boom_pos(1,3);joint2_.z= boom_pos(2,3);
+
+        joints_ready_ = true;
+        // Publish
+        pub_.publish(marker_array);
+    }
+
+    /*
+    LiDAR 1 Callback
+    This is to save the LiDAR 1 point cloud and its information. 
+    If you want curvature, you need to edit this part too
+    */
+    void lidar1_callback(const sensor_msgs::PointCloud2::ConstPtr& msg)
+    {
+        RawCloudPtr cloud_in(new RawCloud());
+        lidar1_cloud_->points.clear();
+        pcl::fromROSMsg(*msg, *cloud_in);
+
+        // Convert lidar1_ext_q_ to Eigen::Matrix3f
+        Eigen::Quaternionf quat(lidar1_ext_q_[3], lidar1_ext_q_[0], lidar1_ext_q_[1], lidar1_ext_q_[2]); // w, x, y, z
+        quat.normalize();
+        Eigen::Matrix3f rot = quat.toRotationMatrix();
+        // ROS_INFO_STREAM("lidar1_rot_:\n" << rot);
+
+        // Convert lidar1_ext_t_ to Eigen::Vector3f
+        Eigen::Vector3f trans(lidar1_ext_t_[0], lidar1_ext_t_[1], lidar1_ext_t_[2]);
+        
+        for (const auto& pt : cloud_in->points) {
+            Eigen::Vector3f p(pt.x, pt.y, pt.z);
+            Eigen::Vector3f p_rotated = rot * p;
+            pcl::PointXYZINormal p_trans;
+            p_trans.x = p_rotated.x() + trans.x();
+            p_trans.y = p_rotated.y() + trans.y();
+            p_trans.z = p_rotated.z() + trans.z();
+            p_trans.intensity = pt.intensity;
+            p_trans.curvature = static_cast<float>(pt.offset_time);
+            p_trans.normal_x = 0.0f;
+            p_trans.normal_y = 0.0f;
+            p_trans.normal_z = 0.0f;
+            lidar1_cloud_->points.push_back(p_trans);
+        }
+
+        sensor_msgs::PointCloud2 cloud_out;
+        pcl::toROSMsg(*lidar1_cloud_, cloud_out);
+        cloud_out.header.frame_id = "world";
+        cloud_out.header.stamp = msg->header.stamp;
+        cloud1_pub_.publish(cloud_out);
+        lidar1_header_ = msg->header;
+        return;
+    }
+
+    /*
+    LiDAR 2 Callback (main part)
+    Now this is the main part. 
+    My goal is to align LiDAR2 to LiDAR1, therefore i will just need 1 extrinsic in the odometry algorithm (LVI-Q). 
+    So, what I do here is two things.
+    */
+    void lidar2_callback(const sensor_msgs::PointCloud2::ConstPtr& msg)
+    {   
+        /*
+        Kinematic alignment
+        Here, i just translate and rotate the point cloud to follow the Excavator boom based on kinematic. 
+        However, as you can see, it’s not always precise because of external disturbance and imprecise kinematic values. 
+        */
+        if(!joints_ready_) return;
+        
+        auto start_p1 = std::chrono::high_resolution_clock::now();
+        RawCloudPtr cloud_in(new RawCloud());
+        pcl::fromROSMsg(*msg, *cloud_in);
+        auto end_p1 = std::chrono::high_resolution_clock::now();
+        auto duration_p1 = std::chrono::duration_cast<std::chrono::microseconds>(end_p1 - start_p1).count();
+        //ROS_INFO("1: ROS to PCL conversion took %ld microseconds", duration_p1);
+
+        geometry_msgs::Point mid;
+        double ratio = manual_len_ratio_;
+        mid.x = ratio * joint1_.x + (1.0 - ratio) * joint2_.x+manual_x_add_;
+        mid.y = ratio * joint1_.y + (1.0 - ratio) * joint2_.y+manual_y_add_;
+        mid.z = ratio * joint1_.z + (1.0 - ratio) * joint2_.z+manual_z_add_;
+
+        CloudPtr transformed_cloud(new Cloud());
+        CloudPtr transformed_cloud2(new Cloud());
+        CloudPtr target_roi_cloud;
+        CloudPtr coarse_stage_cloud;
+        CloudPtr fine_stage_cloud;
+        CloudPtr gicp_stage_cloud;
+        std::vector<float> dynamic_roi_range = {std::numeric_limits<float>::max(), -std::numeric_limits<float>::max(),
+                                                std::numeric_limits<float>::max(), -std::numeric_limits<float>::max(),
+                                                std::numeric_limits<float>::max(), -std::numeric_limits<float>::max()};
+
+        auto end_p2 = std::chrono::high_resolution_clock::now();
+        auto duration_p2 = std::chrono::duration_cast<std::chrono::microseconds>(end_p2 - end_p1).count();
+        //ROS_INFO("2: Midpoint computation took %ld microseconds", duration_p2);
+
+        // Build orthonormal basis
+        Eigen::Vector3d x_axis(joint2_.x - joint1_.x,
+                               joint2_.y - joint1_.y,
+                               joint2_.z - joint1_.z);
+
+        x_axis.normalize();
+
+        Eigen::Vector3d temp_up(0.0, 0.0, 1.0);
+        if (fabs(x_axis.dot(temp_up)) > 0.99) {
+            temp_up = Eigen::Vector3d(0.0, 1.0, 0.0);
+        }
+
+        Eigen::Vector3d z_axis = x_axis.cross(temp_up).normalized();
+        Eigen::Vector3d y_axis = z_axis.cross(x_axis).normalized();
+
+        Eigen::Matrix3d rot_matrix;
+        rot_matrix.col(0) = x_axis;
+        rot_matrix.col(1) = y_axis;
+        rot_matrix.col(2) = z_axis;
+
+        tf2::Matrix3x3 tf_rot(
+            rot_matrix(0, 0), rot_matrix(0, 1), rot_matrix(0, 2),
+            rot_matrix(1, 0), rot_matrix(1, 1), rot_matrix(1, 2),
+            rot_matrix(2, 0), rot_matrix(2, 1), rot_matrix(2, 2)
+        );
+
+        tf2::Quaternion base_q;
+        tf_rot.getRotation(base_q);
+
+        double roll_rad = manual_rotate_roll_ * M_PI / 180.0;
+        double pitch_rad = manual_rotate_pitch_ * M_PI / 180.0;
+        double yaw_rad = manual_rotate_yaw_ * M_PI / 180.0;
+
+        tf2::Quaternion user_q;
+        user_q.setRPY(roll_rad, pitch_rad, yaw_rad);
+
+        tf2::Quaternion final_q = use_marker_ ? base_q * user_q_ : base_q * user_q;
+        final_q.normalize();
+
+        double roll, pitch, yaw;
+        tf2::Matrix3x3(user_q_).getRPY(roll, pitch, yaw);
+        roll = roll * 180.0 / M_PI;
+        pitch = pitch * 180.0 / M_PI;
+        yaw = yaw * 180.0 / M_PI;
+        ROS_INFO("User RPY: Roll: %.2f, Pitch: %.2f, Yaw: %.2f", roll, pitch, yaw);
+
+        tf2::Matrix3x3 rotation(final_q); // Use final_q_no_yaw
+
+        Eigen::Matrix3f rot;
+        rot << rotation[0][0], rotation[0][1], rotation[0][2],
+              rotation[1][0], rotation[1][1], rotation[1][2],
+              rotation[2][0], rotation[2][1], rotation[2][2];
+
+        auto end_p3 = std::chrono::high_resolution_clock::now();
+        auto duration_p3 = std::chrono::duration_cast<std::chrono::microseconds>(end_p3 - end_p2).count();
+        //ROS_INFO("3: Orthonormal basis took %ld microseconds", duration_p3);  
+        
+        for (const auto& pt : cloud_in->points) 
+        {
+            Eigen::Vector3f p(pt.x, pt.y, pt.z);
+            Eigen::Vector3f p_rotated = rot * p;
+            CloudPoint p_trans;
+            p_trans.x = p_rotated.x() + mid.x;
+            p_trans.y = p_rotated.y() + mid.y;
+            p_trans.z = p_rotated.z() + mid.z;
+            p_trans.intensity = pt.intensity;
+            p_trans.curvature = static_cast<float>(pt.offset_time);
+            p_trans.normal_x = 0.0f;
+            p_trans.normal_y = 0.0f;
+            p_trans.normal_z = 0.0f;
+            transformed_cloud->points.push_back(p_trans);
+        }
+        auto end_p4 = std::chrono::high_resolution_clock::now();
+        auto duration_p4 = std::chrono::duration_cast<std::chrono::microseconds>(end_p4 - end_p3).count();
+        //ROS_INFO("4: Transform cloud based on orthonormal took %ld microseconds", duration_p4);
+
+        /*
+        Note also, there is also a part where i add manually some rotation (RPY) to the point cloud to make sure it’s aligned correctly with LiDAR 1 point cloud
+        */
+        double add_roll_rad = additional_rotate_roll_ * M_PI / 180.0;
+        double add_pitch_rad = additional_rotate_pitch_ * M_PI / 180.0;
+        double add_yaw_rad = additional_rotate_yaw_ * M_PI / 180.0;
+        tf2::Quaternion additional_q;
+        additional_q.setRPY(add_roll_rad, add_pitch_rad, add_yaw_rad);
+
+        tf2::Matrix3x3 additional_rotation(additional_q); // Use final_q_no_yaw
+
+        Eigen::Matrix3f additional_rot;
+        additional_rot << additional_rotation[0][0], additional_rotation[0][1], additional_rotation[0][2],
+                          additional_rotation[1][0], additional_rotation[1][1], additional_rotation[1][2],
+                          additional_rotation[2][0], additional_rotation[2][1], additional_rotation[2][2];
+
+        double lidar1_2_diff_time = msg->header.stamp.toSec() - lidar1_header_.stamp.toSec();
+        auto end_p5 = std::chrono::high_resolution_clock::now();
+        auto duration_p5 = std::chrono::duration_cast<std::chrono::microseconds>(end_p5 - end_p4).count();
+        //ROS_INFO("5: Additional rot took %ld microseconds", duration_p5);
+
+        for (const auto& pt : transformed_cloud->points) 
+        {
+
+            Eigen::Vector3f p(pt.x, pt.y, pt.z);
+            if(p.norm()<3.0)
+                continue;
+            Eigen::Vector3f p_rotated = additional_rot * p;
+            CloudPoint p_trans;
+            p_trans.x = p_rotated.x();
+            p_trans.y = p_rotated.y();
+            p_trans.z = p_rotated.z();
+            p_trans.intensity = pt.intensity;
+            p_trans.curvature = pt.curvature;
+            p_trans.normal_x = 0.0f;
+            p_trans.normal_y = 0.0f;
+            p_trans.normal_z = 0.0f;
+            transformed_cloud2->points.push_back(p_trans);
+            
+            dynamic_roi_range[0] = std::min(dynamic_roi_range[0], p_trans.x);
+            dynamic_roi_range[1] = std::max(dynamic_roi_range[1], p_trans.x);
+            dynamic_roi_range[2] = std::min(dynamic_roi_range[2], p_trans.y);
+            dynamic_roi_range[3] = std::max(dynamic_roi_range[3], p_trans.y);
+            dynamic_roi_range[4] = std::min(dynamic_roi_range[4], p_trans.z);
+            dynamic_roi_range[5] = std::max(dynamic_roi_range[5], p_trans.z);
+        }
+        auto end_p6 = std::chrono::high_resolution_clock::now();
+        auto duration_p6 = std::chrono::duration_cast<std::chrono::microseconds>(end_p6 - end_p5).count();
+        //ROS_INFO("6: Additional rot transform took %ld microseconds", duration_p6);
+
+        /*
+        ICP + GICP alignment
+        Here I use ICP to align the LiDAR 1 and LiDAR 2 using voxelized point cloud
+        */
+
+        CloudPtr icp_aligned_cloud(new Cloud());
+        double icp_score = -1.0;
+        Eigen::Matrix3f icp_rot = Eigen::Matrix3f::Identity();
+        Eigen::Vector3f icp_trans = Eigen::Vector3f::Zero();
+
+        std::array<long, kAlignTimerCount> align_step_durations{};
+        auto timer_stage_start = HighResClock::now();
+        auto record_step = [&](AlignTimerStep step) {
+            auto now = HighResClock::now();
+            align_step_durations[static_cast<size_t>(step)] =
+                std::chrono::duration_cast<std::chrono::microseconds>(now - timer_stage_start).count();
+            timer_stage_start = now;
+        };
+
+        AlignMetrics metrics;
+        metrics.source_points = transformed_cloud2->points.size();
+        metrics.target_points = lidar1_cloud_->points.size();
+
+        if (improve_pipeline_enabled_)
+        {
+            if (lidar1_cloud_->points.empty() || transformed_cloud2->points.empty())
+            {
+                ROS_WARN("Improved ICP skipped: lidar1_cloud_ has %zu points, transformed_cloud2 has %zu points",
+                         lidar1_cloud_->points.size(), transformed_cloud2->points.size());
+                record_step(AlignTimerStep::PREP);
+                record_step(AlignTimerStep::ROI);
+                record_step(AlignTimerStep::DOWNSAMPLE_LiDAR1);
+                record_step(AlignTimerStep::DOWNSAMPLE_LiDAR2);
+                record_step(AlignTimerStep::ICP);
+                record_step(AlignTimerStep::GICP);
+                *icp_aligned_cloud = *transformed_cloud2;
+                
+                metrics.source_coarse_points = metrics.source_points;
+                metrics.source_fine_points = metrics.source_points;
+
+                metrics.target_coarse_points = lidar1_cloud_->points.size();
+                metrics.target_fine_points = lidar1_cloud_->points.size();
+            }
+            else
+            {
+                bool dynamic_roi_valid = !transformed_cloud2->points.empty() &&
+                                dynamic_roi_range[0] <= dynamic_roi_range[1] &&
+                                dynamic_roi_range[2] <= dynamic_roi_range[3] &&
+                                dynamic_roi_range[4] <= dynamic_roi_range[5];
+
+                // Crop the target cloud (LiDAR 1) with ROI by source (transformed LiDAR 2) 
+
+                CloudPtr target_roi(new Cloud());
+                target_roi_cloud = target_roi;
+
+                if (improve_use_dynamic_roi_ && dynamic_roi_valid)
+                {
+                    pcl::CropBox<CloudPoint> crop;
+                    Eigen::Vector4f min_vec = Eigen::Vector4f(dynamic_roi_range[0] - static_cast<float>(improve_roi_pad_x_),
+                                                dynamic_roi_range[2] - static_cast<float>(improve_roi_pad_y_),
+                                                dynamic_roi_range[4] - static_cast<float>(improve_roi_pad_z_),
+                                                1.0f);
+                    Eigen::Vector4f max_vec = Eigen::Vector4f(dynamic_roi_range[1] + static_cast<float>(improve_roi_pad_x_),
+                                                dynamic_roi_range[3] + static_cast<float>(improve_roi_pad_y_),
+                                                dynamic_roi_range[5] + static_cast<float>(improve_roi_pad_z_),
+                                                1.0f);
+                    crop.setMin(min_vec);
+                    crop.setMax(max_vec);
+                    crop.setInputCloud(lidar1_cloud_);
+                    crop.filter(*target_roi);
+                }
+                   
+
+                if (target_roi->empty())
+                {
+                    *target_roi = *lidar1_cloud_;
+                }
+                metrics.target_roi_points = target_roi->points.size();
+                ROS_INFO_STREAM_THROTTLE(1.0, "[IMPROVE] ROI cloud size="
+                                            << metrics.target_roi_points);
+                record_step(AlignTimerStep::ROI);
+
+                const float coarse_leaf = static_cast<float>(std::max(improve_coarse_leaf_size_, 0.01));
+                const float fine_leaf = static_cast<float>(std::max(improve_fine_leaf_size_, 0.01));
+                CloudPtr target_coarse = downSampleCloud(target_roi, coarse_leaf);
+                CloudPtr target_fine = downSampleCloud(target_roi, fine_leaf);
+                record_step(AlignTimerStep::DOWNSAMPLE_LiDAR1);
+
+                metrics.target_coarse_points = target_coarse->points.size();
+                metrics.target_fine_points = target_fine->points.size();
+                ROS_INFO_STREAM_THROTTLE(1.0, "[IMPROVE] lidar1 points coarse="
+                                            << metrics.target_coarse_points
+                                            << ", fine=" << metrics.target_fine_points);
+                
+                // ICP with coarse and fine steps
+                    
+                Eigen::Matrix4f initial_guess = Eigen::Matrix4f::Identity();
+                if (icp_first_success_)
+                {
+                    initial_guess.block<3, 3>(0, 0) = last_icp_rot_;
+                    initial_guess.block<3, 1>(0, 3) = last_icp_trans_;
+                }
+                record_step(AlignTimerStep::PREP);
+
+                CloudPtr source_coarse = downSampleCloud(transformed_cloud2, coarse_leaf);
+                CloudPtr source_fine = downSampleCloud(transformed_cloud2, fine_leaf);
+
+                record_step(AlignTimerStep::DOWNSAMPLE_LiDAR2);
+
+                metrics.source_coarse_points = source_coarse->points.size();
+                metrics.source_fine_points = source_fine->points.size();
+
+                ROS_INFO_STREAM_THROTTLE(1.0, "[IMPROVE] Source Downsample sizes coarse="
+                                             << metrics.source_coarse_points
+                                             << ", fine=" << metrics.source_fine_points);
+
+                pcl::IterativeClosestPoint<CloudPoint, CloudPoint> coarse_icp;
+                CloudPtr coarse_output(new Cloud());
+                coarse_stage_cloud = coarse_output;
+                coarse_icp.setInputSource(source_coarse);
+                coarse_icp.setInputTarget(target_coarse);
+                coarse_icp.setMaximumIterations(improve_coarse_max_iterations_);
+                // coarse_icp.setMaximumIterations(10);
+                coarse_icp.setTransformationEpsilon(improve_icp_transformation_epsilon_);
+                // coarse_icp.setTransformationEpsilon(1e-8);
+                coarse_icp.setMaxCorrespondenceDistance(improve_coarse_max_corr_dist_);
+                // coarse_icp.setMaxCorrespondenceDistance(0.5);
+                coarse_icp.setEuclideanFitnessEpsilon(improve_icp_euclidean_epsilon_);
+                // coarse_icp.setEuclideanFitnessEpsilon(1e-8);
+                coarse_icp.align(*coarse_output, initial_guess);
+                Eigen::Matrix4f coarse_transform = initial_guess;
+                if (coarse_icp.hasConverged())
+                {
+                    coarse_transform = coarse_icp.getFinalTransformation();
+                    ROS_INFO_STREAM("[IMPROVE] Coarse ICP converged, fitness="
+                                    << coarse_icp.getFitnessScore());
+                }
+                else
+                {
+                    *coarse_output = *source_coarse;
+                    ROS_WARN("[IMPROVE] Coarse ICP did not converge");
+                }
+
+                pcl::IterativeClosestPoint<CloudPoint, CloudPoint> fine_icp;
+                CloudPtr fine_output(new Cloud());
+                fine_stage_cloud = fine_output;
+                fine_icp.setInputSource(source_fine);
+                fine_icp.setInputTarget(target_fine);
+                fine_icp.setMaximumIterations(improve_fine_max_iterations_);
+                // fine_icp.setMaximumIterations(10);
+                fine_icp.setTransformationEpsilon(improve_icp_transformation_epsilon_);
+                // fine_icp.setTransformationEpsilon(1e-8);
+                fine_icp.setMaxCorrespondenceDistance(improve_fine_max_corr_dist_);
+                // fine_icp.setMaxCorrespondenceDistance(0.5);
+                fine_icp.setEuclideanFitnessEpsilon(improve_icp_euclidean_epsilon_);
+                // fine_icp.setEuclideanFitnessEpsilon(1e-8);
+                fine_icp.align(*fine_output, coarse_transform);
+                Eigen::Matrix4f fine_transform = coarse_transform;
+                bool fine_converged = fine_icp.hasConverged();
+                if (fine_converged)
+                {
+                    fine_transform = fine_icp.getFinalTransformation();
+                    ROS_INFO_STREAM("[IMPROVE] Fine ICP converged, fitness="
+                                    << fine_icp.getFitnessScore());
+                }
+                else if (coarse_icp.hasConverged())
+                {
+                    *fine_output = *coarse_output;
+                    ROS_WARN("[IMPROVE] Fine ICP fell back to coarse result");
+                }
+                else
+                {
+                    *fine_output = *source_fine;
+                    ROS_WARN("[IMPROVE] Fine ICP skipped due to coarse failure");
+                }
+                record_step(AlignTimerStep::ICP);
+
+                Eigen::Matrix4f final_transform = fine_transform;
+                *icp_aligned_cloud = *fine_output;
+                bool gicp_converged = false;
+
+                if (fine_converged)
+                {
+                    CloudPtr gicp_output(new Cloud());
+                    gicp_stage_cloud = gicp_output;
+                    bool gicp_exception = false;
+                    try
+                    {
+                        nano_gicp_.setInputSource(source_fine);
+                        if (gicp_target_stamp_ != lidar1_cache_stamp_)
+                        {
+                            nano_gicp_.setInputTarget(target_fine);
+                            nano_gicp_.calculateTargetCovariances();
+                            gicp_target_stamp_ = lidar1_cache_stamp_;
+                        }
+                        else
+                        {
+                            nano_gicp_.setInputTarget(target_fine);
+                        }
+                        nano_gicp_.calculateSourceCovariances();
+                        nano_gicp_.setMaxCorrespondenceDistance(improve_gicp_max_corr_dist_);
+                        // nano_gicp_.setMaxCorrespondenceDistance(0.5);
+                        nano_gicp_.setMaximumIterations(improve_gicp_max_iterations_);
+                        // nano_gicp_.setMaximumIterations(10);
+                        nano_gicp_.setCorrespondenceRandomness(improve_gicp_correspondence_randomness_);
+                        // nano_gicp_.setCorrespondenceRandomness(20);
+                        nano_gicp_.setTransformationEpsilon(improve_gicp_transformation_epsilon_);
+                        // nano_gicp_.setTransformationEpsilon(1e-6);
+                        nano_gicp_.setEuclideanFitnessEpsilon(improve_gicp_euclidean_fitness_epsilon_);
+                        // nano_gicp_.setEuclideanFitnessEpsilon(1e-6);
+                        nano_gicp_.setRANSACIterations(improve_gicp_ransac_iterations_);
+                        nano_gicp_.align(*gicp_output, fine_transform);
+                        gicp_converged = nano_gicp_.hasConverged();
+                    }
+                    catch (const std::exception& e)
+                    {
+                        ROS_ERROR_STREAM("[IMPROVE] GICP threw exception: " << e.what());
+                        gicp_converged = false;
+                        gicp_exception = true;
+                    }
+                    record_step(AlignTimerStep::GICP);
+
+                    if (!gicp_exception && gicp_converged)
+                    {
+                        final_transform = nano_gicp_.getFinalTransformation();
+                        *icp_aligned_cloud = *gicp_output;
+                        icp_score = nano_gicp_.getFitnessScore();
+                        ROS_INFO_STREAM("[IMPROVE] GICP converged, fitness="
+                                        << icp_score);
+                    }
+                    else
+                    {
+                        icp_score = fine_icp.getFitnessScore();
+                        ROS_WARN("[IMPROVE] GICP did not converge; using fine ICP result");
+                    }
+                }
+                else
+                {
+                    record_step(AlignTimerStep::GICP);
+                    icp_score = coarse_icp.hasConverged() ? coarse_icp.getFitnessScore() : -1.0;
+                    ROS_WARN("[IMPROVE] GICP skipped because fine ICP failed");
+                }
+
+                icp_rot = final_transform.block<3, 3>(0, 0);
+                icp_trans = final_transform.block<3, 1>(0, 3);
+
+                if (!fine_converged && coarse_icp.hasConverged())
+                {
+                    *icp_aligned_cloud = *coarse_output;
+                }
+
+                if (icp_score < 0.0 && fine_converged)
+                {
+                    icp_score = fine_icp.getFitnessScore();
+                }
+
+                metrics.coarse_icp_converged = coarse_icp.hasConverged();
+                metrics.coarse_icp_fitness = coarse_icp.hasConverged() ? coarse_icp.getFitnessScore() : -1.0;
+                metrics.fine_icp_converged = fine_converged;
+                metrics.fine_icp_fitness = fine_converged ? fine_icp.getFitnessScore() : metrics.coarse_icp_fitness;
+                metrics.gicp_converged = gicp_converged;
+                metrics.gicp_fitness = gicp_converged ? icp_score : metrics.fine_icp_fitness;
+                metrics.translation_norm = icp_trans.norm();
+                metrics.rotation_angle_deg = rotationAngleDeg(icp_rot);
+            }
+        }
+        else
+        {   
+
+            // To be updated
+
+            if (lidar1_cloud_->points.size() > 0 && transformed_cloud2->points.size() > 0)
+            {
+                record_step(AlignTimerStep::PREP);
+                record_step(AlignTimerStep::ROI);
+
+                CloudPtr lidar1_cloud_voxelized(new Cloud());
+
+                pcl::VoxelGrid<CloudPoint> voxel;
+                voxel.setInputCloud(transformed_cloud2);
+                voxel.setLeafSize(0.1f, 0.1f, 0.1f); // 1cm voxel size
+                voxel.filter(*transformed_cloud2);
+                voxel.setInputCloud(lidar1_cloud_);
+                voxel.filter(*lidar1_cloud_voxelized);
+                record_step(AlignTimerStep::DOWNSAMPLE_LiDAR1);
+                record_step(AlignTimerStep::DOWNSAMPLE_LiDAR2);
+                metrics.source_coarse_points = transformed_cloud2->points.size();
+                metrics.source_fine_points = metrics.source_coarse_points;
+                metrics.target_coarse_points = lidar1_cloud_voxelized->points.size();
+                metrics.target_fine_points = metrics.target_coarse_points;
+
+                pcl::IterativeClosestPoint<CloudPoint, CloudPoint> icp;
+                icp.setInputSource(transformed_cloud2); // Source
+                icp.setInputTarget(lidar1_cloud_voxelized);     // Target
+                icp.setMaximumIterations(10);
+                icp.setTransformationEpsilon(1e-8);
+                icp.setMaxCorrespondenceDistance(0.5);
+                icp.setEuclideanFitnessEpsilon(1e-8);
+                icp.align(*icp_aligned_cloud);
+                fine_stage_cloud = icp_aligned_cloud;
+                record_step(AlignTimerStep::ICP);
+
+                if (icp.hasConverged())
+                {
+                    nano_gicp_.setInputSource(icp_aligned_cloud);
+                    nano_gicp_.calculateSourceCovariances();
+                    nano_gicp_.setInputTarget(lidar1_cloud_voxelized);
+                    nano_gicp_.calculateTargetCovariances();
+                    bool gicp_converged = false;
+                    bool gicp_exception = false;
+                    try
+                    {
+                        nano_gicp_.align(*icp_aligned_cloud);
+                        gicp_converged = nano_gicp_.hasConverged();
+                        gicp_stage_cloud = icp_aligned_cloud;
+                    }
+                    catch (const std::exception& e)
+                    {
+                        ROS_ERROR_STREAM("GICP threw exception: " << e.what());
+                        gicp_converged = false;
+                        gicp_exception = true;
+                    }
+                    record_step(AlignTimerStep::GICP);
+
+                    if (!gicp_exception && gicp_converged)
+                    {
+                        double fitness = nano_gicp_.getFitnessScore();
+                        Eigen::Matrix4f icp_transform = nano_gicp_.getFinalTransformation();
+                        icp_rot = icp_transform.block<3, 3>(0, 0);
+                        icp_trans = icp_transform.block<3, 1>(0, 3);
+
+                        ROS_INFO("ICP converged with score: %f", fitness);
+                        ROS_INFO_STREAM("ICP Transformation Matrix:\n" << icp_transform);
+                        ROS_INFO("ICP Translation: [%.6f, %.6f, %.6f]", icp_trans.x(), icp_trans.y(), icp_trans.z());
+
+                        double delta = (icp_trans - prev_icp_trans).norm();
+                        std::cout << "(icp_trans-prev_icp_trans).norm():" << delta << std::endl;
+                        if (icp_delta_threshold_ > 0.0 && delta > icp_delta_threshold_)
+                        {
+                            ROS_WARN("ICP delta %.3f m exceeds threshold %.3f m; accepting transform but flagging jump",
+                                     delta, icp_delta_threshold_);
+                        }
+                        icp_score = fitness;
+
+                        prev_icp_trans = icp_trans;
+
+                        Eigen::Quaternionf icp_quat(icp_rot);
+                        ROS_INFO("ICP Quaternion: [x: %.6f, y: %.6f, z: %.6f, w: %.6f]",
+                                 icp_quat.x(), icp_quat.y(), icp_quat.z(), icp_quat.w());
+
+                        metrics.gicp_converged = true;
+                        metrics.gicp_fitness = fitness;
+                        metrics.translation_norm = icp_trans.norm();
+                        metrics.rotation_angle_deg = rotationAngleDeg(icp_rot);
+                    }
+                    else
+                    {
+                        ROS_WARN("GICP did not converge");
+                        metrics.gicp_converged = false;
+                        metrics.gicp_fitness = -1.0;
+                        Eigen::Matrix4f icp_transform = icp.getFinalTransformation();
+                        icp_rot = icp_transform.block<3, 3>(0, 0);
+                        icp_trans = icp_transform.block<3, 1>(0, 3);
+                        metrics.translation_norm = icp_trans.norm();
+                        metrics.rotation_angle_deg = rotationAngleDeg(icp_rot);
+                    }
+                }
+                else
+                {
+                    record_step(AlignTimerStep::GICP);
+                    ROS_WARN("ICP did not converge");
+                }
+
+                metrics.fine_icp_converged = icp.hasConverged();
+                metrics.fine_icp_fitness = icp.hasConverged() ? icp.getFitnessScore() : -1.0;
+                metrics.coarse_icp_converged = metrics.fine_icp_converged;
+                metrics.coarse_icp_fitness = metrics.fine_icp_fitness;
+            }
+            else
+            {
+                ROS_WARN("ICP skipped: lidar1_cloud_ has %zu points, transformed_cloud2 has %zu points",
+                         lidar1_cloud_->points.size(), transformed_cloud2->points.size());
+                record_step(AlignTimerStep::PREP);
+                record_step(AlignTimerStep::ROI);
+                record_step(AlignTimerStep::DOWNSAMPLE_LiDAR1);
+                record_step(AlignTimerStep::DOWNSAMPLE_LiDAR2);
+                record_step(AlignTimerStep::ICP);
+                record_step(AlignTimerStep::GICP);
+                *icp_aligned_cloud = *transformed_cloud2;
+                metrics.source_coarse_points = metrics.source_points;
+                metrics.source_fine_points = metrics.source_points;
+                metrics.target_coarse_points = lidar1_cloud_->points.size();
+                metrics.target_fine_points = lidar1_cloud_->points.size();
+            }
+        }
+
+        const size_t idx_prep = static_cast<size_t>(AlignTimerStep::PREP);
+        const size_t idx_roi = static_cast<size_t>(AlignTimerStep::ROI);
+        const size_t idx_down1 = static_cast<size_t>(AlignTimerStep::DOWNSAMPLE_LiDAR1);
+        const size_t idx_down2 = static_cast<size_t>(AlignTimerStep::DOWNSAMPLE_LiDAR2);
+        const size_t idx_icp = static_cast<size_t>(AlignTimerStep::ICP);
+        const size_t idx_gicp = static_cast<size_t>(AlignTimerStep::GICP);
+
+        const long pre_icp_us = align_step_durations[idx_prep]
+                               + align_step_durations[idx_roi]
+                               + align_step_durations[idx_down1]
+                               + align_step_durations[idx_down2];
+        const long icp_proc_us = align_step_durations[idx_icp]
+                                + align_step_durations[idx_gicp];
+
+        metrics.pre_icp_time_us = static_cast<double>(pre_icp_us);
+        metrics.icp_processing_time_us = static_cast<double>(icp_proc_us);
+
+        pushTimingSample(metrics.pre_icp_time_us / 1000.0, metrics.icp_processing_time_us / 1000.0);
+
+        std::ostringstream status;
+        status << std::fixed << std::setprecision(3);
+        status << "Alignment timers [us]\n"
+               << "  PREP        : " << align_step_durations[idx_prep] << '\n'
+               << "  ROI         : " << align_step_durations[idx_roi] << '\n'
+               << "  DOWNSAMPLE1 : " << align_step_durations[idx_down1] << '\n'
+               << "  DOWNSAMPLE2 : " << align_step_durations[idx_down2] << '\n'
+               << "  ICP         : " << align_step_durations[idx_icp] << '\n'
+               << "  GICP        : " << align_step_durations[idx_gicp] << '\n'
+               << '\n'
+               << "Alignment metrics\n"
+               << "  source pts        : " << metrics.source_points << '\n'
+               << "  source coarse pts : " << metrics.source_coarse_points << '\n'
+               << "  source fine pts   : " << metrics.source_fine_points << '\n'
+               << "  target pts        : " << metrics.target_points << '\n'
+               << "  target ROI pts    : " << metrics.target_roi_points << '\n'
+               << "  target coarse pts : " << metrics.target_coarse_points << '\n'
+               << "  target fine pts   : " << metrics.target_fine_points << '\n'
+               << "  coarse converged  : " << std::boolalpha << metrics.coarse_icp_converged << '\n'
+               << "  coarse fitness    : " << metrics.coarse_icp_fitness << '\n'
+               << "  fine converged    : " << metrics.fine_icp_converged << '\n'
+               << "  fine fitness      : " << metrics.fine_icp_fitness << '\n'
+               << "  gicp converged    : " << metrics.gicp_converged << '\n'
+               << "  gicp fitness      : " << metrics.gicp_fitness << '\n'
+               << "  translation norm  : " << metrics.translation_norm << '\n'
+               << "  rotation deg      : " << metrics.rotation_angle_deg << '\n'
+               << "  pre-ICP time [ms] : " << metrics.pre_icp_time_us / 1000.0 << '\n'
+               << "  ICP time [ms]     : " << metrics.icp_processing_time_us / 1000.0 << '\n';
+
+        std::cout << "\033[2J\033[H" << status.str() << std::flush;
+
+        /*
+        Based on this, the result can be published as a combined LiDAR 1 & 2 using /lidar2_transformed*** topic!
+        From my experience, the hardest part is the ICP & GICP, my problem is that it often fails or if it’s successful all the time, 
+        it requires a long time to process the alignment. 
+        I will need help on this one.
+        */
+
+        CloudPtr final_lidar2 = transformed_cloud2;
+        if (icp_score > 0.0 && icp_score < icp_threshold_ && icp_aligned_cloud && !icp_aligned_cloud->empty())
+        {
+            final_lidar2 = icp_aligned_cloud;
+            last_icp_rot_ = icp_rot;
+            last_icp_trans_ = icp_trans;
+            prev_icp_trans = icp_trans;
+            icp_first_success_ = true;
+        }
+
+        if (lidar1_cloud_->points.size() > 0)
+        {
+            for (auto& point : *transformed_cloud2)
+            {
+                point.intensity = 0.5f;
+            }
+            ROS_INFO("Combined %zu points from lidar1_cloud_ with %zu points from transformed_cloud",
+                     lidar1_cloud_->points.size(), transformed_cloud->points.size());
+        }
+
+        ros::Time publish_stamp = lidar1_header_.stamp.isZero() ? msg->header.stamp : lidar1_header_.stamp;
+        publishStageResults(lidar1_cloud_,
+                            target_roi_cloud,
+                            transformed_cloud2,
+                            coarse_stage_cloud,
+                            fine_stage_cloud,
+                            gicp_stage_cloud,
+                            final_lidar2,
+                            publish_stamp);
+
+        std::cout << "lidar1-lidar2 time:" << std::setprecision(17) << lidar1_2_diff_time << std::endl;
+
+        auto end_p13 = std::chrono::high_resolution_clock::now();
+        auto duration_p13 = std::chrono::duration_cast<std::chrono::microseconds>(end_p13 - end_p6).count();
+        (void)duration_p13;
+
+        return;
+    }
+
+    static CloudPtr downSampleCloud(const CloudPtr& input_cloud, float leaf_size){
+        
+        CloudPtr output_cloud(new Cloud());
+        pcl::VoxelGrid<CloudPoint> voxel;
+        voxel.setInputCloud(input_cloud);
+        voxel.setLeafSize(leaf_size, leaf_size, leaf_size);
+        voxel.filter(*output_cloud);
+
+        // When the filtering is too strong, it may result in an empty cloud
+        if(output_cloud->empty()){
+            *output_cloud = *input_cloud;
+        }
+
+        return output_cloud;
+    }
+
+    static double rotationAngleDeg(const Eigen::Matrix3f& rot)
+    {
+        Eigen::Quaternionf q(rot);
+        if (q.norm() < 1e-6f)
+        {
+            return 0.0;
+        }
+        q.normalize();
+        double angle = 2.0 * std::atan2(q.vec().norm(), q.w());
+        return angle * 180.0 / M_PI;
+    }
+
+    void publishStageResults(const CloudPtr& lidar1,
+                             const CloudPtr& target_roi,
+                             const CloudPtr& kinematics_cloud,
+                             const CloudPtr& coarse_cloud,
+                             const CloudPtr& fine_cloud,
+                             const CloudPtr& gicp_cloud,
+                             const CloudPtr& final_lidar2,
+                             const ros::Time& stamp)
+    {
+        auto publishOriginal = [&](const CloudPtr& cloud, ros::Publisher& pub) {
+            if (!cloud || cloud->empty())
+            {
+                return;
+            }
+
+            sensor_msgs::PointCloud2 cloud_msg;
+            pcl::toROSMsg(*cloud, cloud_msg);
+            cloud_msg.header.frame_id = frame_id_;
+            cloud_msg.header.stamp = stamp;
+            pub.publish(cloud_msg);
+        };
+
+        auto publishColored = [&](const CloudPtr& cloud, ros::Publisher& pub, uint8_t r, uint8_t g, uint8_t b) {
+            if (!cloud || cloud->empty())
+            {
+                return;
+            }
+
+            pcl::PointCloud<pcl::PointXYZRGB>::Ptr colored(new pcl::PointCloud<pcl::PointXYZRGB>());
+            colored->points.reserve(cloud->points.size());
+            for (const auto& pt : cloud->points)
+            {
+                pcl::PointXYZRGB p;
+                p.x = pt.x;
+                p.y = pt.y;
+                p.z = pt.z;
+                p.r = r;
+                p.g = g;
+                p.b = b;
+                colored->points.push_back(p);
+            }
+            colored->width = colored->points.size();
+            colored->height = 1;
+            colored->is_dense = false;
+
+            sensor_msgs::PointCloud2 cloud_msg;
+            pcl::toROSMsg(*colored, cloud_msg);
+            cloud_msg.header.frame_id = frame_id_;
+            cloud_msg.header.stamp = stamp;
+            pub.publish(cloud_msg);
+        };
+
+        publishOriginal(lidar1, cloud1_pub_);
+        publishColored(lidar1, cloud1_rgb_pub_, 255, 0, 0);
+        publishColored(target_roi, cloud1_roi_pub_, 255, 165, 0);
+        publishColored(kinematics_cloud, cloud2_kinematics_pub_, 255, 255, 0);
+        publishColored(coarse_cloud, cloud2_coarse_icp_pub_, 0, 255, 0);
+        publishColored(fine_cloud, cloud2_fine_icp_pub_, 0, 0, 255);
+        publishColored(gicp_cloud, cloud2_gicp_pub_, 75, 0, 130);
+        publishOriginal(final_lidar2, cloud2_pub_);
+
+        CloudPtr merged(new Cloud());
+        if (lidar1 && !lidar1->empty())
+        {
+            *merged += *lidar1;
+        }
+        if (final_lidar2 && !final_lidar2->empty())
+        {
+            *merged += *final_lidar2;
+        }
+
+        if (!merged->empty())
+        {
+            merged->width = merged->points.size();
+            merged->height = 1;
+            merged->is_dense = false;
+
+            sensor_msgs::PointCloud2 cloud_msg;
+            pcl::toROSMsg(*merged, cloud_msg);
+            cloud_msg.header.frame_id = frame_id_;
+            cloud_msg.header.stamp = stamp;
+            cloud_merged_pub_.publish(cloud_msg);
+        }
+
+        pcl::PointCloud<pcl::PointXYZRGB>::Ptr merged_rgb(new pcl::PointCloud<pcl::PointXYZRGB>());
+        if (lidar1 && !lidar1->empty())
+        {
+            merged_rgb->points.reserve(lidar1->points.size());
+            for (const auto& pt : lidar1->points)
+            {
+                pcl::PointXYZRGB p;
+                p.x = pt.x;
+                p.y = pt.y;
+                p.z = pt.z;
+                p.r = 0;
+                p.g = 255;
+                p.b = 255;
+                merged_rgb->points.push_back(p);
+            }
+        }
+        if (final_lidar2 && !final_lidar2->empty())
+        {
+            merged_rgb->points.reserve(merged_rgb->points.size() + final_lidar2->points.size());
+            for (const auto& pt : final_lidar2->points)
+            {
+                pcl::PointXYZRGB p;
+                p.x = pt.x;
+                p.y = pt.y;
+                p.z = pt.z;
+                p.r = 255;
+                p.g = 0;
+                p.b = 255;
+                merged_rgb->points.push_back(p);
+            }
+        }
+
+        if (!merged_rgb->empty())
+        {
+            merged_rgb->width = merged_rgb->points.size();
+            merged_rgb->height = 1;
+            merged_rgb->is_dense = false;
+
+            sensor_msgs::PointCloud2 cloud_msg;
+            pcl::toROSMsg(*merged_rgb, cloud_msg);
+            cloud_msg.header.frame_id = frame_id_;
+            cloud_msg.header.stamp = stamp;
+            cloud_merged_rgb_pub_.publish(cloud_msg);
+        }
+    }
+
+};
+
+int main(int argc, char** argv)
+{
+    ros::init(argc, argv, "kinematic_chain");
+    KinematicChainVisualizer visualizer;
+    ros::spin();
+    return 0;
+}

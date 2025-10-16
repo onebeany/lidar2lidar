@@ -1,0 +1,33 @@
+<?xml version="1.0"?>
+<package format="2">
+  <name>lidar2lidar</name>
+  <version>0.0.0</version>
+  <description>LiDAR2-to-LiDAR1 alignment visualization with scan registration</description>
+
+  <maintainer email="wonbin.lee@kaist.ac.kr">wonbin</maintainer>
+
+  <license>TODO</license>
+z
+  <buildtool_depend>catkin</buildtool_depend>
+
+  <depend>roscpp</depend>
+  <depend>std_msgs</depend>
+  <depend>sensor_msgs</depend>
+  <depend>nav_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>visualization_msgs</depend>
+  <depend>interactive_markers</depend>
+  <depend>tf2</depend>
+  <depend>tf2_ros</depend>
+  <depend>tf2_geometry_msgs</depend>
+  <depend>pcl_ros</depend>
+  <depend>pcl_conversions</depend>
+  <depend>nano_gicp</depend>
+  <depend>quatro</depend>
+
+  <exec_depend>rviz</exec_depend>
+
+  <export>
+
+  </export>
+</package>
