@@ -87,12 +87,12 @@ public:
         server_.reset(new interactive_markers::InteractiveMarkerServer("lidar_orientation_control"));
         createInteractiveMarker();
 
-        nano_gicp_.setMaxCorrespondenceDistance(0.5);
+        nano_gicp_.setMaxCorrespondenceDistance(1.0);
         nano_gicp_.setNumThreads(20);
         nano_gicp_.setCorrespondenceRandomness(20);
-        nano_gicp_.setMaximumIterations(10);
-        nano_gicp_.setTransformationEpsilon(1e-6);
-        nano_gicp_.setEuclideanFitnessEpsilon(1e-6);
+        nano_gicp_.setMaximumIterations(30);
+        nano_gicp_.setTransformationEpsilon(1e-4);
+        nano_gicp_.setEuclideanFitnessEpsilon(1e-4);
         nano_gicp_.setRANSACIterations(50);
     }
 
@@ -453,10 +453,10 @@ private:
             icp.setInputTarget(lidar1_cloud_voxelized);     // Target
 
             // Set ICP parameters
-            icp.setMaximumIterations(10);          // Max number of iterations
-            icp.setTransformationEpsilon(1e-8);    // Convergence criterion for transformation
-            icp.setMaxCorrespondenceDistance(0.5); // Max distance for point correspondences (adjust based on your data)
-            icp.setEuclideanFitnessEpsilon(1e-8);  // Convergence criterion for fitness score
+            icp.setMaximumIterations(30);          // Max number of iterations
+            icp.setTransformationEpsilon(1e-4);    // Convergence criterion for transformation
+            icp.setMaxCorrespondenceDistance(1.0); // Max distance for point correspondences (adjust based on your data)
+            icp.setEuclideanFitnessEpsilon(1e-4);  // Convergence criterion for fitness score
             auto end_p8 = std::chrono::high_resolution_clock::now();
             auto duration_p8 = std::chrono::duration_cast<std::chrono::microseconds>(end_p8 - end_p7).count();
             //ROS_INFO("8: Set point cloud took %ld microseconds", duration_p8);
@@ -511,7 +511,7 @@ private:
                 //ROS_INFO("11: GICP align took %ld microseconds", duration_p11);
                 ROS_INFO("GICP score: %f", nano_gicp_.getFitnessScore());
 
-                if (nano_gicp_.getFitnessScore()<icp_threshold_)
+                if (nano_gicp_.getFitnessScore()<icp_threshold_ && nano_gicp_.hasConverged())
                 {
                     ROS_INFO("GICP converged with score: %f", nano_gicp_.getFitnessScore());
                     Eigen::Matrix4f icp_transform = nano_gicp_.getFinalTransformation();
@@ -557,7 +557,7 @@ private:
         //              // lidar1_2_diff_time>0.0 && lidar1_2_diff_time<0.1)
         if( icp_score>0.0 && icp_score<icp_threshold_)
         {
-            //*publish_cloud+=*icp_aligned_cloud; // Use ICP aligned cloud
+            *publish_cloud+=*icp_aligned_cloud; // Use ICP aligned cloud
             last_icp_rot_=icp_rot;
             last_icp_trans_=icp_trans;
             icp_first_success_=true;

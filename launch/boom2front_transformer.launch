@@ -1,0 +1,45 @@
+<launch>
+    
+    <node pkg="lidar2lidar" 
+          type="boom2front_transformer" 
+          name="visualize_lidar2lidar" 
+          output="screen">
+
+        <rosparam param="lidar1_ext_q_">[0, 0, 0, 1.0]</rosparam>
+        <rosparam param="lidar1_ext_t_">[0.0, 0.0, 0.0]</rosparam>
+
+        <rosparam param="manual_rotate_">[0.0, 0.0, -102.04]</rosparam>
+        <rosparam param="additional_rotate_">[-0.4549159, -0.4494354, 89.57962]</rosparam>
+        <rosparam param="manual_additional_trans_">[0.7, 2.0, -1.37]</rosparam>
+        <param name="manual_len_ratio_" type="double" value="0.0" />
+
+        <param name="icp_threshold_" type="double" value="4.0"/>
+        <param name="icp_delta_threshold_" type="double" value="0.4"/>
+
+        <param name="improve_roi_pad_x_" type="double" value="0.5" />
+        <param name="improve_roi_pad_y_" type="double" value="0.5" />
+        <param name="improve_roi_pad_z_" type="double" value="2.0" />
+
+        <param name="improve_coarse_leaf_size_" type="double" value="0.25" />
+        <param name="improve_fine_leaf_size_" type="double" value="0.12" />
+        <param name="improve_coarse_max_iterations_" type="int" value="5" />
+        <param name="improve_fine_max_iterations_" type="int" value="5" />
+        <param name="improve_coarse_max_corr_dist_" type="double" value="0.8" />
+        <param name="improve_fine_max_corr_dist_" type="double" value="0.4" />
+        
+        <param name="improve_icp_transformation_epsilon_" type="double" value="1e-8" />
+        <param name="improve_icp_euclidean_epsilon_" type="double" value="1e-8" />
+        <param name="improve_gicp_max_corr_dist_" type="double" value="0.5" />
+        <param name="improve_gicp_max_iterations_" type="int" value="10" />
+        <param name="improve_gicp_correspondence_randomness_" type="int" value="20" />
+        <param name="improve_gicp_ransac_iterations_" type="int" value="50" />
+        <param name="improve_gicp_transformation_epsilon_" type="double" value="1e-6" />
+        <param name="improve_gicp_euclidean_fitness_epsilon_" type="double" value="1e-6" />
+
+    </node>
+
+    <node launch-prefix="nice" pkg="rviz" type="rviz" name="rviz" output="screen"
+          args="-d $(find lidar2lidar)/config/rviz_cfg/kinematic_custom.rviz"/>
+    </node>
+
+</launch>
